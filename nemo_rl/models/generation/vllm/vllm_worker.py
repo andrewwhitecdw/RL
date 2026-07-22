@@ -174,27 +174,37 @@ class BaseVllmGenerationWorker:
             # node-local slot. When it is not provided, use the original index,
             # which is correct for engines that fit within one node.
             mp_size = len(local_bundle_indices)
-            if num_gpus_per_node is None:
+            engine_index_on_node: Optional[int]
+            if num_gpus_per_node is not None and mp_size > num_gpus_per_node:
+                # The engine spans several nodes, so leave VLLM_PORT unset and let
+                # vLLM fall back to ephemeral ports the way a vanilla deployment
+                # does. vLLM 0.25's RayExecutorV2 probes for the torch TCPStore
+                # port starting at VLLM_PORT but only binds it later, in the
+                # rank-0 worker; in between, the cross-node broadcast MessageQueue
+                # allocates from that same range via get_open_port() and
+                # deterministically steals the probed port (DeepSeek-V3 generation
+                # TP=32: EADDRINUSE on port 7000 at engine startup). An engine that
+                # fits on one node uses a shm-only MessageQueue, so nothing else
+                # scans the range and it keeps the deterministic base below the
+                # ephemeral floor.
+                engine_index_on_node = None
+            elif num_gpus_per_node is None:
                 engine_index_on_node = (
                     local_bundle_indices[0]
                     if mp_size == 1
                     else local_bundle_indices[0] // mp_size
                 )
-            elif mp_size > num_gpus_per_node:
-                # The engine spans several nodes. Each engine's rank-0 process is
-                # on a different node, so every such engine can use node-local
-                # slot 0 without colliding.
-                engine_index_on_node = 0
             elif mp_size == 1:
                 engine_index_on_node = local_bundle_indices[0] % num_gpus_per_node
             else:
                 engine_index_on_node = (
                     local_bundle_indices[0] % num_gpus_per_node
                 ) // mp_size
-            env_vars["VLLM_PORT"] = str(
-                DEFAULT_VLLM_PORT_RANGE_LOW
-                + engine_index_on_node * DEFAULT_VLLM_PORTS_PER_ENGINE
-            )
+            if engine_index_on_node is not None:
+                env_vars["VLLM_PORT"] = str(
+                    DEFAULT_VLLM_PORT_RANGE_LOW
+                    + engine_index_on_node * DEFAULT_VLLM_PORTS_PER_ENGINE
+                )
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)

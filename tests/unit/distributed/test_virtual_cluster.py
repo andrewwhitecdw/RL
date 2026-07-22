@@ -467,18 +467,9 @@ class TestVllmPortAssignment:
             (8, (0, [7]), 7),
             (8, (0, [4, 5, 6, 7]), 1),  # (4 % 8) // 4
             (8, (0, [0, 1, 2, 3, 4, 5, 6, 7]), 0),  # 8-GPU engine
-            # A model-parallel size larger than the per-node GPU count means the
-            # engine spans several nodes. Each engine's rank-0 process is on a
-            # different node, so they all use node-local slot 0. The original
-            # index would instead climb (the second engine gives 16 // 16 = 1,
-            # and so on).
-            (8, (0, list(range(16))), 0),  # 16-GPU engine across 2 nodes
-            (8, (0, list(range(16, 32))), 0),  # second such engine
-            (8, (0, list(range(32, 48))), 0),  # third such engine
             # 4 GPUs per node, for example GB200 NVL72.
             (4, (0, [3]), 3),  # 3 % 4
             (4, (0, [0, 1, 2, 3]), 0),  # 4-GPU engine
-            (4, (0, list(range(8, 16))), 0),  # 8-GPU engine across 2 nodes
         ],
     )
     def test_vllm_port_assignment_respects_num_gpus_per_node(
@@ -501,6 +492,36 @@ class TestVllmPortAssignment:
             DEFAULT_VLLM_PORT_RANGE_LOW + expected_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
         )
         assert env_vars["VLLM_PORT"] == str(expected_port)
+
+    @pytest.mark.parametrize(
+        "num_gpus_per_node,bundle_indices",
+        [
+            (8, (0, list(range(16)))),  # 16-GPU engine across 2 nodes
+            (8, (0, list(range(16, 32)))),  # second such engine
+            (8, (0, list(range(32)))),  # DeepSeek-V3 generation TP=32, 4 nodes
+            (4, (0, list(range(8, 16)))),  # 8-GPU engine across 2 GB200 nodes
+        ],
+    )
+    def test_no_vllm_port_for_engines_that_span_nodes(
+        self, num_gpus_per_node, bundle_indices
+    ):
+        """Node-spanning engines must fall back to ephemeral ports.
+
+        vLLM 0.25's RayExecutorV2 probes the TCPStore port from VLLM_PORT but
+        binds it later, and the cross-node broadcast MessageQueue allocates from
+        the same range in between, so a deterministic base is stolen before it is
+        bound (EADDRINUSE at engine startup).
+        """
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1,
+            bundle_indices=bundle_indices,
+            num_gpus_per_node=num_gpus_per_node,
+        )
+        assert "VLLM_PORT" not in env_vars
 
     def test_no_vllm_port_without_bundle_indices(self):
         from nemo_rl.models.generation.vllm.vllm_worker import (
